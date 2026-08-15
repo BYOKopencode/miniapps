@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+users.json
+capture.txt
+.git/
+.gitignore
+.github/
+*.zip
+.DS_Store
+.pytest_cache/

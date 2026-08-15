@@ -1,0 +1,18 @@
+[
+  {
+    "api_key": "paste-your-random-key-for-user-a",
+    "name": "user-a",
+    "jwt": "paste-user-a-jwt-cookie",
+    "csrf_token": "paste-user-a-x-csrf-token-header",
+    "csrf_cookie": "paste-user-a-__Host-miniapps.x-csrf-token-cookie",
+    "cf_bm": "",
+    "user_email": "user-a@example.com"
+  },
+  {
+    "api_key": "paste-your-random-key-for-user-b",
+    "name": "user-b",
+    "jwt": "paste-user-b-jwt-cookie",
+    "csrf_token": "paste-user-b-x-csrf-token-header",
+    "csrf_cookie": "paste-user-b-__Host-miniapps.x-csrf-token-cookie"
+  }
+]

@@ -1,0 +1,42 @@
+# Save a real capture as capture.txt (gitignored), then either:
+#   MINIAPPS_CAPTURE_FILE=capture.txt
+#   python reseed.py capture.txt --write-env .env
+#   python reseed.py capture.txt --push https://your-app.up.railway.app --key $MINIAPPS_API_KEY
+#
+# In Chrome DevTools > Network, right-click any api.miniapps.ai request and pick
+# "Copy as cURL" or "Copy as fetch". Both shapes parse, as does the Python
+# `requests` snippet below. Values here are fake.
+
+import requests
+
+cookies = {
+    '__Host-miniapps.x-csrf-token': 'paste-the-short-csrf-cookie',
+    'jwt': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.paste-the-real-payload.paste-the-signature',
+    '__cf_bm': 'paste-the-cloudflare-cookie',
+}
+
+headers = {
+    'accept': 'application/json',
+    'content-type': 'application/json',
+    'origin': 'https://miniapps.ai',
+    'referer': 'https://miniapps.ai/',
+    'x-csrf-token': 'paste-the-long-csrf-header',
+}
+
+json_data = {
+    'toolSettings': {
+        'webSearch': True,
+        'codeInterpreter': True,
+        'canvas': False,
+        'flightSearch': False,
+        'locationSearch': False,
+        'conversationLookup': False,
+    },
+}
+
+response = requests.put(
+    'https://api.miniapps.ai/conversations/00000000-0000-0000-0000-000000000000',
+    cookies=cookies,
+    headers=headers,
+    json=json_data,
+)
