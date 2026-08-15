@@ -1,18 +1,10 @@
-# Secrets - never commit a real session
 .env
 .env.*
 !.env.example
 users.json
 capture.txt
-
-# Python
 __pycache__/
-*.py[cod]
-*.egg-info/
-.pytest_cache/
+*.pyc
 .venv
 venv
-
-# Misc
-*.zip
 .DS_Store

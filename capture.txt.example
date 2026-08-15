@@ -1,18 +1,23 @@
-# Save a real capture as capture.txt (gitignored), then either:
-#   MINIAPPS_CAPTURE_FILE=capture.txt
-#   python reseed.py capture.txt --write-env .env
-#   python reseed.py capture.txt --push https://your-app.up.railway.app --key $MINIAPPS_API_KEY
+# Paste a captured request here and rename this file to capture.txt.
 #
-# In Chrome DevTools > Network, right-click any api.miniapps.ai request and pick
-# "Copy as cURL" or "Copy as fetch". Both shapes parse, as does the Python
-# `requests` snippet below. Values here are fake.
+# How to capture:
+#   1. Open miniapps.ai signed in, open DevTools -> Network.
+#   2. Toggle any tool in a conversation so a request to api.miniapps.ai fires.
+#   3. Right-click it -> Copy -> "Copy as cURL" or "Copy as Python requests".
+#   4. Paste the whole thing below. Field order and quoting do not matter.
+#
+# The parser needs exactly three values: the `jwt` cookie, the
+# `__Host-miniapps.x-csrf-token` cookie, and the `x-csrf-token` header.
+# `__cf_bm` is picked up when present but is optional.
+#
+# Verify a capture before deploying:  python reseed.py capture.txt
 
 import requests
 
 cookies = {
-    '__Host-miniapps.x-csrf-token': 'paste-the-short-csrf-cookie',
-    'jwt': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.paste-the-real-payload.paste-the-signature',
-    '__cf_bm': 'paste-the-cloudflare-cookie',
+    '__Host-miniapps.x-csrf-token': '<short csrf value>',
+    'jwt': '<jwt token>',
+    '__cf_bm': '<cloudflare bot cookie, optional>',
 }
 
 headers = {
@@ -20,7 +25,7 @@ headers = {
     'content-type': 'application/json',
     'origin': 'https://miniapps.ai',
     'referer': 'https://miniapps.ai/',
-    'x-csrf-token': 'paste-the-long-csrf-header',
+    'x-csrf-token': '<long csrf value>',
 }
 
 json_data = {
@@ -35,7 +40,7 @@ json_data = {
 }
 
 response = requests.put(
-    'https://api.miniapps.ai/conversations/00000000-0000-0000-0000-000000000000',
+    'https://api.miniapps.ai/conversations/<conversation-uuid>',
     cookies=cookies,
     headers=headers,
     json=json_data,
