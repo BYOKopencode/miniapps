@@ -1,47 +1,38 @@
-"""MCP tool definitions, shared by the SSE server in app.py and mcp_stdio.py.
-
-Keeping the schemas and dispatch in one module means the HTTP transport and the
-stdio transport can never drift apart.
-"""
+"""Shared MCP tool definitions, used by both the SSE server and stdio server."""
 from __future__ import annotations
 
 from typing import Any, Dict
 
 from proxy import TOOL_KEYS, MiniAppsProxy
 
-_TOOL_FLAGS: Dict[str, Any] = {
-    key: {"type": "boolean", "description": f"Enable or disable the {key} tool."}
-    for key in TOOL_KEYS
+_TOOL_FLAGS = {
+    key: {"type": "boolean", "description": f"Enable or disable {key}"} for key in TOOL_KEYS
 }
 
 TOOL_DEFS = [
     {
         "name": "get_tool_settings",
-        "description": "Read the current tool toggles for a miniapps.ai conversation.",
+        "description": "Read the six tool toggles (webSearch, codeInterpreter, canvas, "
+        "flightSearch, locationSearch, conversationLookup) for a miniapps.ai conversation.",
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "conversation_id": {"type": "string", "description": "Conversation UUID."}
-            },
+            "properties": {"conversation_id": {"type": "string", "description": "Conversation UUID"}},
             "required": ["conversation_id"],
         },
     },
     {
         "name": "set_tool_settings",
-        "description": (
-            "Enable or disable tools for a conversation. Only the flags you pass are "
-            "changed; set merge=false to force every unlisted flag to false, which is "
-            "what the browser PUT does."
-        ),
+        "description": "Update tool toggles for a conversation. Only the flags you pass are "
+        "changed; set merge=false to force every unlisted flag to false.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "conversation_id": {"type": "string", "description": "Conversation UUID."},
+                "conversation_id": {"type": "string", "description": "Conversation UUID"},
                 **_TOOL_FLAGS,
                 "merge": {
                     "type": "boolean",
+                    "description": "Preserve unlisted flags (default true)",
                     "default": True,
-                    "description": "Keep flags that were not passed. Defaults to true.",
                 },
             },
             "required": ["conversation_id"],
@@ -52,18 +43,13 @@ TOOL_DEFS = [
         "description": "Fetch the full conversation object from miniapps.ai.",
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "conversation_id": {"type": "string", "description": "Conversation UUID."}
-            },
+            "properties": {"conversation_id": {"type": "string"}},
             "required": ["conversation_id"],
         },
     },
     {
         "name": "raw_request",
-        "description": (
-            "Call any api.miniapps.ai endpoint with the stored browser session. "
-            "Use this for endpoints this server does not model yet."
-        ),
+        "description": "Escape hatch: call any api.miniapps.ai path with the stored session.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -72,69 +58,53 @@ TOOL_DEFS = [
                     "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"],
                     "default": "GET",
                 },
-                "path": {
-                    "type": "string",
-                    "description": "Upstream path, e.g. /conversations/<uuid>.",
-                },
-                "body": {"type": "object", "description": "Optional JSON body."},
-                "params": {"type": "object", "description": "Optional query parameters."},
+                "path": {"type": "string", "description": "Upstream path, e.g. /conversations"},
+                "body": {"type": "object", "description": "Optional JSON body"},
+                "query": {"type": "object", "description": "Optional query parameters"},
             },
             "required": ["path"],
         },
     },
     {
         "name": "session_status",
-        "description": (
-            "Report the stored miniapps.ai session: user, issue/expiry times, and "
-            "whether the jwt needs reseeding."
-        ),
+        "description": "Report the signed-in miniapps account, JWT expiry, and time remaining.",
         "inputSchema": {"type": "object", "properties": {}},
     },
 ]
 
 
-def dispatch(proxy: MiniAppsProxy, name: str, arguments: Dict[str, Any]) -> Any:
-    """Run one MCP tool call against a proxy and return a JSON-safe result."""
-    args = arguments or {}
+def dispatch(proxy: MiniAppsProxy, name: str, arguments: Dict[str, Any] | None) -> Any:
+    """Run one MCP tool call against a proxy and return a JSON-serialisable result."""
+    args = dict(arguments or {})
 
     if name == "get_tool_settings":
-        conversation_id = _require(args, "conversation_id")
+        conversation_id = args["conversation_id"]
         return {
             "conversationId": conversation_id,
             "toolSettings": proxy.get_tool_settings(conversation_id),
         }
 
     if name == "set_tool_settings":
-        conversation_id = _require(args, "conversation_id")
+        conversation_id = args.pop("conversation_id")
+        merge = bool(args.pop("merge", True))
         desired = {key: bool(args[key]) for key in TOOL_KEYS if key in args}
         if not desired:
             raise ValueError("Pass at least one of: " + ", ".join(TOOL_KEYS))
-        return proxy.set_tool_settings(
-            conversation_id, desired, merge=bool(args.get("merge", True))
-        )
+        return proxy.set_tool_settings(conversation_id, desired, merge=merge)
 
     if name == "get_conversation":
-        return proxy.get_conversation(_require(args, "conversation_id"))
+        return proxy.get_conversation(args["conversation_id"])
 
     if name == "raw_request":
         status, body = proxy.request(
-            str(args.get("method", "GET")),
-            _require(args, "path"),
+            args.get("method", "GET"),
+            args["path"],
             json_body=args.get("body"),
-            params=args.get("params"),
+            params=args.get("query"),
         )
         return {"status": status, "body": body}
 
     if name == "session_status":
         return proxy.status()
 
-    raise ValueError(
-        f"Unknown tool {name!r}. Available: " + ", ".join(tool["name"] for tool in TOOL_DEFS)
-    )
-
-
-def _require(args: Dict[str, Any], field: str) -> str:
-    value = args.get(field)
-    if not value or not isinstance(value, str):
-        raise ValueError(f"{field} is required and must be a string.")
-    return value
+    raise ValueError(f"Unknown tool: {name}")

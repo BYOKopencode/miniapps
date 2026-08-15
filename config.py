@@ -1,205 +1,194 @@
-"""Configuration for the MiniApps Agent API.
-
-Credentials can arrive three ways, in priority order:
-
-1. ``MINIAPPS_USERS`` / ``MINIAPPS_USERS_FILE`` - a JSON array, for multi-tenant use.
-2. ``MINIAPPS_CAPTURE`` / ``MINIAPPS_CAPTURE_FILE`` - a pasted DevTools request
-   (cURL or Python ``requests``), parsed by :mod:`reseed`.
-3. Individual ``MINIAPPS_JWT`` / ``MINIAPPS_CSRF_TOKEN`` / ``MINIAPPS_CSRF_COOKIE`` vars.
-"""
+"""Environment-driven configuration and multi-user credential loading."""
 from __future__ import annotations
 
 import json
-import logging
 import secrets
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-from reseed import parse_captured_request
-
-log = logging.getLogger("miniapps.config")
-
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/151.0.0.0 Safari/537.36"
-)
-
-# Anything that still looks like it came from .env.example.
-PLACEHOLDER_MARKERS = ("paste-", "your-", "replace-me", "changeme", "<", "example-value")
 
 
 class UserConfig(BaseModel):
-    """One miniapps.ai browser session, addressable by API key."""
+    """One API consumer and its independent miniapps.ai browser identity."""
 
     model_config = ConfigDict(extra="ignore")
 
-    api_key: str
-    name: str = "default"
-    jwt: str
-    csrf_token: str
-    csrf_cookie: str
+    api_key: str = Field(min_length=1)
+    name: str | None = None
+
+    # Credentials copied out of a signed-in miniapps.ai session.
+    jwt: str = Field(min_length=1)          # `jwt` cookie
+    csrf_token: str = Field(min_length=1)   # `x-csrf-token` request header (long value)
+    csrf_cookie: str = Field(min_length=1)  # `__Host-miniapps.x-csrf-token` cookie (short value)
+
+    # Optional: Cloudflare bot-management cookie. It lives ~30 minutes and the
+    # proxy keeps whatever Cloudflare hands back, so seeding it is never required.
     cf_bm: str = ""
+
+    # Informational only; both are derived from the JWT when omitted.
     user_id: str = ""
     user_email: str = ""
 
+    @field_validator("*", mode="after")
+    @classmethod
+    def reject_placeholder_values(cls, value: str | None, info) -> str | None:
+        """Catch unfilled placeholders early.
 
-def reject_placeholder_values(user: UserConfig) -> UserConfig:
-    """Fail fast when the example values were deployed unchanged."""
-    offenders = [
-        field
-        for field in ("api_key", "jwt", "csrf_token", "csrf_cookie")
-        if any(marker in (getattr(user, field) or "").lower() for marker in PLACEHOLDER_MARKERS)
-    ]
-    if offenders:
-        raise RuntimeError(
-            f"User {user.name!r} still uses placeholder values for: {', '.join(offenders)}. "
-            "Copy a real authenticated request from DevTools and set the MINIAPPS_* vars."
-        )
-    return user
+        Credentials are sent as HTTP header and cookie values, which must be
+        latin-1 encodable. A copy-pasted placeholder such as `<jwt — see .env>`
+        would otherwise fail deep inside the request with an opaque codec error.
+        """
+        if not isinstance(value, str):
+            return value
+        try:
+            value.encode("latin-1")
+        except UnicodeEncodeError as exc:
+            raise ValueError(
+                f"{info.field_name} contains a non-latin-1 character "
+                f"({exc.object[exc.start]!r}); it looks like an unreplaced placeholder "
+                "rather than a real credential"
+            ) from exc
+        if value.startswith("<") and value.endswith(">"):
+            raise ValueError(
+                f"{info.field_name} is still the placeholder {value!r}; "
+                "replace it with the real value"
+            )
+        return value
 
 
 class Settings(BaseSettings):
-    """Environment-driven settings. Reads a local .env when present."""
-
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
 
-    # Auth for *this* API (not for miniapps.ai)
-    miniapps_api_key: str = ""
+    # Authentication / multi-user sources
     require_api_key: bool = True
+    miniapps_users_file: str = "users.json"
+    miniapps_users: str | None = None
 
-    # Single-user credentials
-    miniapps_jwt: str = ""
-    miniapps_csrf_token: str = ""
-    miniapps_csrf_cookie: str = ""
-    miniapps_cf_bm: str = ""
-    miniapps_user_email: str = ""
+    # Captured browser request (cURL / python-requests dump)
+    miniapps_capture_file: str = "capture.txt"
+    miniapps_capture: str | None = None
 
-    # Multi-user credentials
-    miniapps_users: str = ""
-    miniapps_users_file: str = ""
+    # Legacy single-user configuration
+    miniapps_api_key: str | None = None
+    miniapps_jwt: str | None = None
+    miniapps_csrf_token: str | None = None
+    miniapps_csrf_cookie: str | None = None
+    miniapps_cf_bm: str | None = None
+    miniapps_user_email: str | None = None
 
-    # Seed straight from a captured request
-    miniapps_capture: str = ""
-    miniapps_capture_file: str = ""
-
-    # Upstream
+    # Endpoints / upstream behaviour
     miniapps_api_base: str = "https://api.miniapps.ai"
     miniapps_frontend_base: str = "https://miniapps.ai"
-    miniapps_user_agent: str = DEFAULT_USER_AGENT
-    request_timeout: float = 30.0
+    miniapps_user_agent: str = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+    )
+    request_timeout: float = 60.0
 
-    # Server
+    # Server / MCP
     host: str = "0.0.0.0"
     port: int = 5000
     log_level: str = "info"
-
-    # MCP
-    mcp_server_name: str = "miniapps"
+    mcp_server_name: str = "miniapps-agent"
     mcp_server_version: str = "1.0.0"
 
+    def _parse_user_array(self, value: Any, source: str) -> list[UserConfig]:
+        try:
+            raw = json.loads(value) if isinstance(value, str) else value
+            if not isinstance(raw, list):
+                raise ValueError("must be a JSON array")
+            return [UserConfig.model_validate(item) for item in raw]
+        except (json.JSONDecodeError, ValidationError, ValueError, TypeError) as exc:
+            raise RuntimeError(f"Invalid user configuration in {source}: {exc}") from exc
 
-def _parse_user_array(raw: str, source: str) -> List[UserConfig]:
-    try:
-        payload: Any = json.loads(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"{source} is not valid JSON: {exc}") from exc
-    if isinstance(payload, dict):
-        payload = [payload]
-    if not isinstance(payload, list) or not payload:
-        raise RuntimeError(f"{source} must be a non-empty JSON array of user objects.")
-    return [UserConfig(**entry) for entry in payload]
+    def load_users(self) -> list[UserConfig]:
+        """Merge file, inline JSON, capture, and legacy sources; later sources win by key."""
+        merged: dict[str, UserConfig] = {}
 
+        users_path = Path(self.miniapps_users_file)
+        if users_path.is_file():
+            for user in self._parse_user_array(users_path.read_text("utf-8"), str(users_path)):
+                merged[user.api_key] = user
 
-def _resolve_capture_key(settings: Settings) -> str:
-    """API key for a capture-seeded user, generating one if needed."""
-    if settings.miniapps_api_key:
-        return settings.miniapps_api_key
-    if not settings.require_api_key:
-        return "local"
-    generated = secrets.token_urlsafe(24)
-    log.warning(
-        "No MINIAPPS_API_KEY set. Generated a temporary key for this process: %s", generated
-    )
-    return generated
+        if self.miniapps_users:
+            for user in self._parse_user_array(self.miniapps_users, "MINIAPPS_USERS"):
+                merged[user.api_key] = user
 
+        # Captured browser request -> credentials (highest-priority single user).
+        capture_text = self.miniapps_capture
+        if not capture_text:
+            capture_path = Path(self.miniapps_capture_file)
+            if capture_path.is_file():
+                capture_text = capture_path.read_text("utf-8")
+        if capture_text:
+            from reseed import parse_captured_request
 
-def load_users(settings: Settings) -> List[UserConfig]:
-    """Build the user list from whichever configuration style is present."""
-    if settings.miniapps_users.strip():
-        users = _parse_user_array(settings.miniapps_users, "MINIAPPS_USERS")
-    elif settings.miniapps_users_file.strip():
-        path = Path(settings.miniapps_users_file)
-        if not path.is_file():
-            raise RuntimeError(f"MINIAPPS_USERS_FILE does not exist: {path}")
-        users = _parse_user_array(path.read_text(encoding="utf-8"), str(path))
-    else:
-        users = [_single_user(settings)]
+            parsed = parse_captured_request(capture_text)
+            if parsed["_missing"]:
+                raise RuntimeError(
+                    "Captured request is missing required fields: "
+                    + ", ".join(parsed["_missing"])
+                    + ". Re-copy the request from DevTools (Copy as cURL / as Python requests)."
+                )
+            merged_key = self._resolve_capture_key()
+            captured = UserConfig.model_validate({
+                "api_key": merged_key,
+                "name": "captured",
+                "jwt": parsed["jwt"],
+                "csrf_token": parsed["csrf_token"],
+                "csrf_cookie": parsed["csrf_cookie"],
+                "cf_bm": parsed.get("cf_bm") or "",
+                "user_id": parsed.get("user_id") or "",
+                "user_email": self.miniapps_user_email or parsed.get("user_email") or "",
+            })
+            merged[captured.api_key] = captured
 
-    keys = [user.api_key for user in users]
-    if len(set(keys)) != len(keys):
-        raise RuntimeError("Every configured user needs a unique api_key.")
-    return [reject_placeholder_values(user) for user in users]
+        # `api_key` is handled separately: the credential fields below decide
+        # whether legacy single-user mode is in use at all.
+        legacy_values = {
+            "jwt": self.miniapps_jwt,
+            "csrf_token": self.miniapps_csrf_token,
+            "csrf_cookie": self.miniapps_csrf_cookie,
+        }
+        if any(value is not None for value in legacy_values.values()) and not capture_text:
+            missing = [key for key, value in legacy_values.items() if value is None]
+            if missing:
+                raise RuntimeError(
+                    "Incomplete legacy user configuration; missing: " + ", ".join(missing)
+                )
+            legacy = UserConfig.model_validate({
+                **legacy_values,
+                "api_key": self._resolve_capture_key("legacy"),
+                "name": "legacy",
+                "cf_bm": self.miniapps_cf_bm or "",
+                "user_email": self.miniapps_user_email or "",
+            })
+            merged[legacy.api_key] = legacy
 
-
-def _single_user(settings: Settings) -> UserConfig:
-    """One user from explicit vars, falling back to a captured request."""
-    values: Dict[str, str] = {
-        "jwt": settings.miniapps_jwt.strip(),
-        "csrf_token": settings.miniapps_csrf_token.strip(),
-        "csrf_cookie": settings.miniapps_csrf_cookie.strip(),
-        "cf_bm": settings.miniapps_cf_bm.strip(),
-        "user_email": settings.miniapps_user_email.strip(),
-    }
-
-    capture = _read_capture(settings)
-    if capture:
-        parsed = parse_captured_request(capture)
-        if parsed["_missing"]:
+        if not merged:
             raise RuntimeError(
-                "Captured request is missing: "
-                + ", ".join(parsed["_missing"])
-                + ". Copy an authenticated api.miniapps.ai request from DevTools."
+                "No miniapps users configured. Add capture.txt, users.json, MINIAPPS_USERS, "
+                "or the legacy MINIAPPS_* variables."
             )
-        for field in ("jwt", "csrf_token", "csrf_cookie", "cf_bm", "user_id", "user_email"):
-            if not values.get(field) and parsed.get(field):
-                values[field] = str(parsed[field])
-        if parsed.get("_expired"):
-            log.warning(
-                "The captured jwt already expired at %s. Calls will fail until you reseed.",
-                parsed.get("expires_at"),
+        return list(merged.values())
+
+    def _resolve_capture_key(self, mode: str = "captured") -> str:
+        """API key for single-user sources, or a random one when auth is disabled."""
+        if self.miniapps_api_key:
+            return self.miniapps_api_key
+        if self.require_api_key:
+            raise RuntimeError(
+                f"{mode.capitalize()} credentials found but MINIAPPS_API_KEY is not set. "
+                "Add MINIAPPS_API_KEY=<your-key> to authenticate requests, or set "
+                "REQUIRE_API_KEY=false for local single-user development."
             )
-
-    missing = [field for field in ("jwt", "csrf_token", "csrf_cookie") if not values.get(field)]
-    if missing:
-        raise RuntimeError(
-            "Missing credentials: "
-            + ", ".join(f"MINIAPPS_{field.upper()}" for field in missing)
-            + ". Set them directly, or set MINIAPPS_CAPTURE/MINIAPPS_CAPTURE_FILE to a "
-            "captured request, or MINIAPPS_USERS for multi-user mode."
-        )
-
-    return UserConfig(
-        api_key=_resolve_capture_key(settings),
-        name=values.get("user_email") or "default",
-        **values,
-    )
-
-
-def _read_capture(settings: Settings) -> Optional[str]:
-    if settings.miniapps_capture.strip():
-        return settings.miniapps_capture
-    if settings.miniapps_capture_file.strip():
-        path = Path(settings.miniapps_capture_file)
-        if not path.is_file():
-            raise RuntimeError(f"MINIAPPS_CAPTURE_FILE does not exist: {path}")
-        return path.read_text(encoding="utf-8")
-    return None
+        # Auth disabled: any key is accepted, so a random internal key is fine.
+        return f"local-{secrets.token_urlsafe(16)}"
 
 
 settings = Settings()
-users = load_users(settings)
+users = settings.load_users()

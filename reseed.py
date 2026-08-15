@@ -1,131 +1,140 @@
-"""Parse a captured miniapps.ai request into reusable session credentials.
+"""Auto-reseed miniapps.ai credentials from a captured browser request.
 
-Usable as a library (``parse_captured_request``) and as a CLI:
+Copy the request from browser DevTools (Network tab, right-click any
+`api.miniapps.ai` request -> Copy as cURL / Copy as Python requests) and paste
+it into a file. Any authenticated request works, because every one of them
+carries the three things the proxy needs:
 
+  * `jwt` cookie                          -> the session token
+  * `__Host-miniapps.x-csrf-token` cookie -> the CSRF pair, cookie half
+  * `x-csrf-token` header                 -> the CSRF pair, header half
+
+`__cf_bm` is picked up too when present, but it is optional: Cloudflare hands
+out a fresh one on the first request.
+
+Everything is matched by name and by JWT claims, so field order, quoting style,
+and extra analytics cookies do not matter.
+
+Usage:
+    python reseed.py capture.txt
     python reseed.py capture.txt --json
     python reseed.py capture.txt --write-env .env
-    python reseed.py capture.txt --push https://your-app.up.railway.app --key $MINIAPPS_API_KEY
-
-miniapps.ai has no token refresh endpoint, so "reseeding" a fresh browser
-capture is the supported way to renew a session.
+    python reseed.py capture.txt --push https://host --key sk-...
 """
 from __future__ import annotations
 
 import argparse
 import base64
-import binascii
 import json
 import re
 import sys
-import time
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-_JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{4,}\.eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]+")
+_JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
 
+# Cookie/header names as they appear in a capture.
 _JWT_COOKIE = "jwt"
 _CSRF_COOKIE = "__Host-miniapps.x-csrf-token"
 _CSRF_HEADER = "x-csrf-token"
 _CF_BM_COOKIE = "__cf_bm"
 
+# Required to talk to the API at all.
 _REQUIRED = ("jwt", "csrf_token", "csrf_cookie")
+# Nice to have; regenerated automatically when absent.
 _OPTIONAL = ("cf_bm",)
 
-_ENV_KEYS = {
-    "jwt": "MINIAPPS_JWT",
-    "csrf_token": "MINIAPPS_CSRF_TOKEN",
-    "csrf_cookie": "MINIAPPS_CSRF_COOKIE",
-    "cf_bm": "MINIAPPS_CF_BM",
-    "user_email": "MINIAPPS_USER_EMAIL",
-}
+_ENV_KEYS = [
+    ("MINIAPPS_JWT", "jwt"),
+    ("MINIAPPS_CSRF_TOKEN", "csrf_token"),
+    ("MINIAPPS_CSRF_COOKIE", "csrf_cookie"),
+    ("MINIAPPS_CF_BM", "cf_bm"),
+    ("MINIAPPS_USER_EMAIL", "user_email"),
+]
 
 
-def _find_value(text: str, name: str) -> str:
+def _find_value(name: str, text: str) -> Optional[str]:
     """Find a cookie/header value in any of the shapes DevTools produces.
 
-    Three styles are supported:
+    Three styles are supported, tried in order:
+      1. python-requests dict:  'x-csrf-token': 'value'
+      2. cookie string:         __Host-miniapps.x-csrf-token=value; jwt=value
+      3. cURL header:           -H 'x-csrf-token: value'
 
-    1. object literals - ``'jwt': 'eyJ...'``
-    2. cookie strings  - ``jwt=eyJ...; __cf_bm=...``
-    3. cURL headers    - ``-H 'x-csrf-token: 5be...'``
-
-    The order matters: the cookie pattern is tried before the colon pattern so
-    a request for ``x-csrf-token`` can never return the ``__Host-`` cookie.
+    The name must match exactly and be preceded by a real delimiter. That is
+    what stops a lookup of `x-csrf-token` from returning the value of
+    `__Host-miniapps.x-csrf-token`, whose name merely ends with it.
     """
-    boundary = r"(?:^|[;,\s'\"({])"
-    patterns = (
+    patterns = [
         r"['\"]" + re.escape(name) + r"['\"]\s*[:=]\s*['\"]([^'\"]+)['\"]",
-        boundary + re.escape(name) + r"\s*=\s*([^;'\"\s,]+)",
-        boundary + re.escape(name) + r"\s*:\s*([^;'\"\r\n]+)",
-    )
+        r"(?:^|[;,\s&'\"(])" + re.escape(name) + r"=([^;'\"\s&]+)",
+        r"(?:^|[;,\s'\"(])" + re.escape(name) + r"\s*:\s*([^;'\"\r\n]+)",
+    ]
     for pattern in patterns:
         match = re.search(pattern, text, re.MULTILINE)
         if match:
             return match.group(1).strip().strip("'\"").rstrip("\\").strip()
-    return ""
+    return None
 
 
 def _b64json(segment: str) -> Dict[str, Any]:
-    padded = segment + "=" * (-len(segment) % 4)
-    try:
-        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
-        payload = json.loads(decoded.decode("utf-8"))
-    except (ValueError, binascii.Error, UnicodeDecodeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    segment += "=" * (-len(segment) % 4)
+    return json.loads(base64.urlsafe_b64decode(segment))
 
 
 def decode_jwt(token: str) -> Dict[str, Any]:
-    """Decode a JWT payload without verifying its signature.
-
-    Only used to read `id`, `email`, `iat`, and `exp` for status reporting;
-    miniapps.ai remains the authority on whether a token is accepted.
-    """
-    if not token or token.count(".") != 2:
+    """Return a JWT's claims, or an empty dict when it cannot be decoded."""
+    parts = (token or "").split(".")
+    if len(parts) < 2:
         return {}
-    return _b64json(token.split(".")[1])
+    try:
+        return _b64json(parts[1])
+    except Exception:
+        return {}
 
 
-def _best_session_jwt(text: str) -> str:
-    """Pick the session token when a capture contains several JWT-shaped values."""
-    named = _find_value(text, _JWT_COOKIE)
-    if named and named.count(".") == 2:
-        return named
-    candidates: List[str] = _JWT_RE.findall(text)
-    for candidate in candidates:
-        claims = decode_jwt(candidate)
-        if claims.get("id") or claims.get("email"):
-            return candidate
-    return candidates[0] if candidates else ""
+def _best_session_jwt(text: str) -> tuple[Optional[str], Dict[str, Any]]:
+    """Pick the freshest miniapps session JWT in a capture.
 
-
-def parse_captured_request(raw: str) -> Dict[str, Any]:
-    """Extract credentials + session metadata from a pasted request.
-
-    Never raises on bad input: callers decide how to treat `_missing`.
+    A miniapps session token carries `id` and `email` claims. Selecting by
+    claims rather than by position means a capture that also contains unrelated
+    tokens still resolves correctly.
     """
-    text = raw or ""
-    values: Dict[str, Any] = {
-        "jwt": _best_session_jwt(text),
-        "csrf_token": _find_value(text, _CSRF_HEADER),
-        "csrf_cookie": _find_value(text, _CSRF_COOKIE),
-        "cf_bm": _find_value(text, _CF_BM_COOKIE),
+    best: Optional[str] = None
+    best_claims: Dict[str, Any] = {}
+    for token in _JWT_RE.findall(text):
+        claims = decode_jwt(token)
+        if not claims or not ("id" in claims or "email" in claims):
+            continue
+        if best is None or claims.get("iat", 0) >= best_claims.get("iat", 0):
+            best, best_claims = token, claims
+    return best, best_claims
+
+
+def parse_captured_request(text: str) -> Dict[str, Any]:
+    """Extract every proxy credential found in a captured request."""
+    session_jwt, claims = _best_session_jwt(text)
+    jwt = session_jwt or _find_value(_JWT_COOKIE, text)
+    if not claims and jwt:
+        claims = decode_jwt(jwt)
+
+    expires_at = claims.get("exp")
+    parsed: Dict[str, Any] = {
+        "jwt": jwt,
+        "csrf_token": _find_value(_CSRF_HEADER, text),
+        "csrf_cookie": _find_value(_CSRF_COOKIE, text),
+        "cf_bm": _find_value(_CF_BM_COOKIE, text),
+        "user_id": claims.get("id"),
+        "user_email": claims.get("email"),
+        "issued_at": _iso(claims.get("iat")),
+        "expires_at": _iso(expires_at),
     }
-
-    # The header and cookie CSRF values are different strings; if only one was
-    # found, do not silently reuse it for the other.
-    claims = decode_jwt(str(values["jwt"]))
-    values["user_id"] = str(claims.get("id") or "")
-    values["user_email"] = str(claims.get("email") or "")
-    values["issued_at"] = _iso(claims.get("iat"))
-    values["expires_at"] = _iso(claims.get("exp"))
-
-    exp = claims.get("exp")
-    values["_expired"] = bool(isinstance(exp, (int, float)) and exp < time.time())
-    values["_missing"] = [field for field in _REQUIRED if not values.get(field)]
-    values["_missing_optional"] = [field for field in _OPTIONAL if not values.get(field)]
-    return values
+    parsed["_missing"] = [name for name in _REQUIRED if not parsed.get(name)]
+    parsed["_missing_optional"] = [name for name in _OPTIONAL if not parsed.get(name)]
+    parsed["_expired"] = bool(
+        expires_at and expires_at < datetime.now(tz=timezone.utc).timestamp()
+    )
+    return parsed
 
 
 def _iso(epoch: Any) -> Optional[str]:
@@ -135,28 +144,21 @@ def _iso(epoch: Any) -> Optional[str]:
         return None
 
 
-def to_env_block(values: Dict[str, Any]) -> str:
-    """Render parsed credentials as MINIAPPS_* environment lines."""
-    lines = []
-    for field, env_key in _ENV_KEYS.items():
-        value = values.get(field)
-        if value:
-            lines.append(f"{env_key}={value}")
-    return "\n".join(lines)
+def to_env_block(parsed: Dict[str, Any]) -> str:
+    return "\n".join(
+        f"{env}={parsed[key]}" for env, key in _ENV_KEYS if parsed.get(key)
+    )
 
 
-def _write_env(path: Path, values: Dict[str, Any]) -> List[str]:
-    """Upsert the MINIAPPS_* lines in an .env file, leaving other keys alone."""
-    updates = {
-        env_key: str(values[field])
-        for field, env_key in _ENV_KEYS.items()
-        if values.get(field)
-    }
-    existing = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
-    out: List[str] = []
-    seen = set()
+def _write_env(path: str, parsed: Dict[str, Any]) -> None:
+    from pathlib import Path
+
+    updates = dict(line.split("=", 1) for line in to_env_block(parsed).splitlines())
+    target = Path(path)
+    existing = target.read_text("utf-8").splitlines() if target.is_file() else []
+    out, seen = [], set()
     for line in existing:
-        key = line.split("=", 1)[0].strip()
+        key = line.split("=", 1)[0] if "=" in line else None
         if key in updates:
             out.append(f"{key}={updates[key]}")
             seen.add(key)
@@ -165,102 +167,74 @@ def _write_env(path: Path, values: Dict[str, Any]) -> List[str]:
     for key, value in updates.items():
         if key not in seen:
             out.append(f"{key}={value}")
-    path.write_text("\n".join(out) + "\n", encoding="utf-8")
-    return sorted(updates)
+    target.write_text("\n".join(out) + "\n", "utf-8")
 
 
-def _push(base_url: str, api_key: Optional[str], values: Dict[str, Any]) -> Dict[str, Any]:
-    """POST the parsed credentials to a running instance's /auth/reseed."""
+def _push(base: str, key: str, text: str) -> None:
     import requests
 
-    payload = {
-        field: values[field]
-        for field in ("jwt", "csrf_token", "csrf_cookie", "cf_bm", "user_id", "user_email")
-        if values.get(field)
-    }
-    headers = {"content-type": "application/json"}
-    if api_key:
-        headers["authorization"] = f"Bearer {api_key}"
-    response = requests.post(
-        f"{base_url.rstrip('/')}/auth/reseed", json=payload, headers=headers, timeout=30
+    resp = requests.post(
+        f"{base.rstrip('/')}/auth/reseed",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json={"raw": text},
+        timeout=30,
     )
-    try:
-        body = response.json()
-    except ValueError:
-        body = response.text
-    return {"status": response.status_code, "body": body}
+    print(f"POST /auth/reseed -> {resp.status_code}")
+    print(resp.text[:1000])
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description="Turn a captured miniapps.ai request into session credentials."
+        description="Reseed miniapps.ai credentials from a captured browser request."
     )
-    parser.add_argument(
-        "capture",
-        nargs="?",
-        help="File containing the copied request. Reads stdin when omitted.",
-    )
-    parser.add_argument("--json", action="store_true", help="Print parsed values as JSON.")
-    parser.add_argument("--write-env", metavar="PATH", help="Upsert MINIAPPS_* keys into this .env file.")
-    parser.add_argument("--push", metavar="BASE_URL", help="POST the credentials to a running instance.")
-    parser.add_argument("--key", help="API key to use with --push.")
+    parser.add_argument("file", help="File containing the cURL or Python-requests capture")
+    parser.add_argument("--json", action="store_true", help="Print the parsed result as JSON")
+    parser.add_argument("--push", metavar="BASE_URL", help="POST the capture to a live /auth/reseed")
+    parser.add_argument("--key", help="API key, required with --push")
+    parser.add_argument("--write-env", metavar="PATH", help="Update the MINIAPPS_* keys in this .env")
     args = parser.parse_args(argv)
 
-    if args.capture:
-        path = Path(args.capture)
-        if not path.is_file():
-            print(f"No such file: {path}", file=sys.stderr)
-            return 2
-        raw = path.read_text(encoding="utf-8")
-    else:
-        raw = sys.stdin.read()
-
-    values = parse_captured_request(raw)
+    with open(args.file, encoding="utf-8") as handle:
+        text = handle.read()
+    parsed = parse_captured_request(text)
 
     if args.json:
-        print(json.dumps(values, indent=2))
+        print(json.dumps(parsed, indent=2))
     else:
-        for field in (*_REQUIRED, *_OPTIONAL):
-            value = values.get(field)
-            state = f"{str(value)[:12]}... ({len(str(value))} chars)" if value else "MISSING"
-            print(f"{field:12} {state}")
-        if values.get("user_email") or values.get("user_id"):
-            print(f"session user  {values.get('user_email')} ({values.get('user_id')})")
-        if values.get("issued_at"):
-            print(f"issued at     {values['issued_at']}")
-        if values.get("expires_at"):
-            print(f"expires at    {values['expires_at']}")
+        print("Parsed credentials:")
+        for env, key in _ENV_KEYS:
+            value = parsed.get(key)
+            shown = (value[:40] + "...") if value and len(value) > 40 else (value or "")
+            flag = "OK     " if value else ("MISSING" if key in _REQUIRED else "absent ")
+            print(f"  {env:22} {flag}  {shown}")
+        print(f"\n  session user   {parsed.get('user_email') or '?'} ({parsed.get('user_id') or '?'})")
+        print(f"  issued at      {parsed.get('issued_at') or '?'}")
+        print(f"  expires at     {parsed.get('expires_at') or '?'}")
 
-    if values["_missing"]:
-        print(
-            "\nMissing required values: " + ", ".join(values["_missing"]) + ".\n"
-            "Copy an authenticated request to api.miniapps.ai (right-click a request in\n"
-            "DevTools > Network, then Copy as cURL or Copy as fetch).",
-            file=sys.stderr,
-        )
+    if parsed["_missing"]:
+        print("\nERROR: required fields missing:", ", ".join(parsed["_missing"]))
+        print("This capture does not identify a session. Re-copy the request.")
         return 1
-    if values["_expired"]:
+
+    if parsed["_expired"]:
         print(
-            f"\nWarning: this jwt already expired at {values['expires_at']}.", file=sys.stderr
+            "\nWARNING: this JWT is already expired. miniapps.ai exposes no refresh\n"
+            "endpoint, so sign in again and re-copy a fresh request."
         )
-    if values["_missing_optional"]:
-        print(
-            "Note: no __cf_bm cookie in this capture. That is fine - Cloudflare issues a "
-            "fresh one on the first call.",
-            file=sys.stderr,
-        )
+
+    if not args.json:
+        print("\n--- env block (paste into Railway / .env) ---")
+        print(to_env_block(parsed))
 
     if args.write_env:
-        written = _write_env(Path(args.write_env), values)
-        print(f"\nWrote {', '.join(written)} to {args.write_env}")
-
+        _write_env(args.write_env, parsed)
+        print(f"\nWrote {args.write_env}")
     if args.push:
-        result = _push(args.push, args.key, values)
-        print("\n" + json.dumps(result, indent=2))
-        return 0 if 200 <= int(result["status"]) < 300 else 1
-
+        if not args.key:
+            parser.error("--push requires --key")
+        _push(args.push, args.key, text)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
